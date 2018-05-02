@@ -1,0 +1,52 @@
+---
+
+# The configuration allows for you to turn on and off aspects of the build that you want to use.  Just set docker_instance to false and configure with the details of the component in your environment.
+# If the docker_instance is set to false, it will use the credentials to check for connectivity, on the manually configured hosts
+#
+# Ldap type is either 'Open' for OpenLDAP or 'AD' for Active Directory.  If using Active Directory, the docker_instance variable  has to be false
+#
+
+# Path where the GIT repo is located
+repo_path: /root/bastion-proxy/
+
+# Vault Config, configure the token if you set docker_instance to false and you are using your own Vault instance
+vault:  { 
+  docker_instance: true,
+  version: 0.9.6,
+  host: vault,
+  vault_port: 9200,
+  token: ''
+}
+
+# OpenLDAP or AD LDAP Config.
+ldap: {  
+  docker_instance: true,
+  ldap_type: Open,
+  host: openldap,
+  ldap_port: 389,
+  ldap_user: "cn=admin,dc=proxysql,dc=com",
+  ldap_pass: password,
+  ldap_base: "dc=proxysql,dc=com"
+}
+
+# ProxySQL Config
+proxysql: {
+  docker_instance: true,
+  proxysql_host: "127.0.0.1",
+  admin_proxysql_port: 6032,
+  proxysql_port: 3306,
+  admin_pass: admin,
+  remote_admin_user: radmin,
+  remote_admin_pass: radminpass
+}
+
+# MySQL Inventory Config.  If not using a docker instance.  Make sure to manually create the inventory_user is preconfigured with All access and grant option.  Update the parameters with the inventory username and password.
+mysql_inventory: {
+  docker_instance: true,
+  mysql_host: "127.0.0.1",
+  mysql_port: 3301,
+  user: root,
+  pass: password,
+  mysql_inventory_user: inventory_user,
+  mysql_inventory_pass: inventory_password
+}

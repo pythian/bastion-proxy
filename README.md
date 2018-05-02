@@ -1,204 +1,204 @@
-# bastion
-A solution to streamline user access to MySQL, allowing users to self-serve access using their LDAP credentials, while logging all access.
+# MySQL Bastion Proxy
 
-# Table of Contents
-1. [Prerequisites](#prerequisites)
-2. [How to use](#usage)
-3. [MySQL](#mysql)
-4. [Vault](#vault)
-5. [ProxySQL](#proxysql)
-6. [LDAP](#ldap)
+## Overview
 
-# Prerequisites
-this repo
+This is a multi component solution that will use ProxySQL, LDAP, Vault, and MySQL to create a bastion that will provide a secure way to access your MySQL servers that addresses the following points of concern
 
-Docker installed (18.04.0-ce)
+- Central user management using LDAP
+- MySQL credentials are managed and secured using Vault
+- Temporary passwords limited by time using Vault
+- Query logging by user using ProxySQL
+- Access to MySQL through ProxySQL (No Direct access to the database servers)
 
-# How to use <a name="usage"></a>
+## How it works
 
-From the directory containing the docker-compose.yaml included in this repo, start the cluster:
-```
-docker-compose up -d 
-```
+Here is an overview of how a fully built bastion/proxy works together to provide secure access to the MySQL servers.
+1. User uses vault client to authenticate to the vault server (On Bastion or Standalone)
+2. Vault used LDAP and validates the users credentials and returns to them a token
+3. Client uses token to request credentials for a MySQL server by reading a vault database policy
+4. Vault validates in LDAP that the user is allowed to get credentials for the role they requested
+5. Vault creates new credentials and places them in the mysql inventory server
+6. The sync script finds the new credentials and creates the accounts on the destination MySQL server
+7. The sync script updates ProxySQL with the user account that vault created and maps it to the MySQL server using host groups
+8. The user logins to ProxySQL using the credentials vault provides
+9. ProxySQL routes the connection for the specific user to the MySQL server
+10. After the timeframe has passed vault removes the MySQL user account from mysql inventory
+11. Sync script sees that the user account no longer exists and removes the account from the MySQL server and ProxySQL.
 
-Run the following to stop and destroy the cluster:
-```
-docker-compose down
-```
 
-Use Kitematic in Docker for Mac or Docker for Windows (recommended) or enter an example container like this:
-```
-docker exec -it app bash
-```
+## Cloning the Repo
 
-Do all of the below on the app server unless otherwise indicated.
+Clone the repo to /root
 
-# MySQL <a name="mysql"></a>
+## Base Software 
 
-For a single node of mysql, edit the image line (line 39) as needed for version. The latest mysql image is currently 8.0, and the configured image in the Docker configuration file is 5.7. To run 5.6, for example, edit the line to:
-`image: dataindataout/mysql:5.6`
+The base software that is needed on the server where the configuration will run are the following
 
-Then start mysql replication on the ops container:
-`source initiate_replication.sh mysqlprimary mysqlreplica`
+- Ansible (http://docs.ansible.com/ansible/latest/intro_installation.html)
+- Software Packages
+  - unzip
+  - git
+  - wget
+  - curl
+  - ldap client (YUM Package : openldap-clients OR APT Package : ldap-utils)
+- Docker (https://docs.docker.com/install/)
+- Ansible Modules for Hashicorp Vault (https://pypi.python.org/pypi/ansible-modules-hashivault)
+- Hashicorp Vault (https://www.vaultproject.io/docs/install/index.html)
+- Oracle MySQL Client (https://dev.mysql.com/downloads/mysql/)
 
-# Using Vault <a name="vault"></a>
+## Base Software Auto Install
 
-## Initialize/unseal Vault
-`source initiate_vault.sh`
+The base software can also be installed by first installing ansible and then using the included ansible playbook in the initiate directory.  Currently only the Ubuntu configuration has been tested.
 
-## Hello world
-```
-vault write secret/admin email=blah@blah.com password=mysecretpassword
-```
-
-Output
-```
-Success! Data written to: secret/admin
+``` bash
+ansible-playbook mysql-proxy-base-software.yml
 ```
 
-`vault read secret/admin`
+## Edit Build Configuration
 
-Output
-```
-Key                 Value
----                 -----
-refresh_interval    768h0m0s
-email               blah@blah.com
-password            mysecretpassword
+Before running the ansible playbook to build the bastion server.  Edit and configure the config file to your liking.
+
+``` bash
+vi mysql-proxy-build-config.yml
 ```
 
-## Set up vault to save database credentials
-`vault mount database`
+## Run Ansible Build Script
 
-Output
-`Successfully mounted 'database' at 'database'!`
+Using the configuration file, the playbook will build the server.  Make sure to run the source command to load the Vault environment variables, or you can log off and back in as root.
 
-Assuming the following connection string works:
-`mysql -hmysqlprimary -uroot -ppassword`
-
-```
-vault write database/config/mysql \
-    plugin_name=mysql-database-plugin \
-    connection_url="root:password@tcp(mysqlprimary:3306)/" \
-    allowed_roles="readonly"
+``` bash
+ansible-playbook mysql-proxy-build-playbook.yml
+source /root/.bashrc
 ```
 
-Expected output
+## Validate Connectivity
+
+Now the bastion components are built, you should now be able to login to the MySQL inventory server, ProxySQL, Vault and OpenLDAP.
+
+**Testing MySQL Inventory Access**
+
+You should be able to just type mysql on the command line which will use the ~/.my.cnf configuration file to login.  In the example below I logged in as as the inventory_user account, and show the database and table exists.
+
+``` bash
+root@bastion:~/bastion-proxy# mysql
+
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 8
+Server version: 5.7.22 MySQL Community Server (GPL)
+
+Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> show grants;
++-----------------------------------------------------------------------+
+| Grants for inventory_user@%                                           |
++-----------------------------------------------------------------------+
+| GRANT ALL PRIVILEGES ON *.* TO 'inventory_user'@'%' WITH GRANT OPTION |
++-----------------------------------------------------------------------+
+1 row in set (0.00 sec)
+
+mysql> use mysql_inventory
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Database changed
+mysql> show create table hosts\G
+*************************** 1. row ***************************
+       Table: hosts
+Create Table: CREATE TABLE `hosts` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `host` varchar(255) DEFAULT NULL,
+  `ip` varchar(45) DEFAULT NULL,
+  `port` int(11) DEFAULT '3306',
+  `enabled` tinyint(4) DEFAULT '1',
+  `creds_created_count` int(11) DEFAULT '0',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1
+1 row in set (0.00 sec)
+
 ```
-The following warnings were returned from the Vault server:
-* Read access to this endpoint should be controlled via ACLs as it will return the connection details as is, including passwords, if any.
+
+**Testing ProxySQL Access**
+
+``` bash
+root@bastion:~/bastion-proxy# mysql --defaults-file=~/.proxysql.cnf
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 5
+Server version: 5.5.30 (ProxySQL Admin Module)
+
+Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> show tables;
++--------------------------------------------+
+| tables                                     |
++--------------------------------------------+
+| global_variables                           |
+| mysql_collations                           |
+| mysql_group_replication_hostgroups         |
+| mysql_query_rules                          |
+| mysql_replication_hostgroups               |
+| mysql_servers                              |
+| mysql_users                                |
+| proxysql_servers                           |
+| runtime_checksums_values                   |
+| runtime_global_variables                   |
+| runtime_mysql_group_replication_hostgroups |
+| runtime_mysql_query_rules                  |
+| runtime_mysql_replication_hostgroups       |
+| runtime_mysql_servers                      |
+| runtime_mysql_users                        |
+| runtime_proxysql_servers                   |
+| runtime_scheduler                          |
+| scheduler                                  |
++--------------------------------------------+
+18 rows in set (0.00 sec)
 ```
 
-## Set up credentials for expirable user/role
-Write to roles; don't replace the name and password placeholders.
+**Testing Vault Access**
 
-```
-vault write database/roles/readonly \
-    db_name=mysql \
-    creation_statements="CREATE USER '{{name}}'@'%' IDENTIFIED BY '{{password}}';GRANT SELECT ON *.* TO '{{name}}'@'%';" \
-    default_ttl="1h" \
-    max_ttl="24h"
-```
+Make sure you have run 'source /root/.bashrc' to export the variables that Vault uses to login with.  Below shows that the vault is not sealed and it's possible to list the policies
 
-Output
-`Success! Data written to: database/roles/readonly`
-
-## Read from credentials to get user/pass
-There is an API to do this, and all of this, programmatically.
-
-`vault read database/creds/readonly`
-
-Output
-```
+``` bash
+root@bastion:~/bastion-proxy# vault status
 Key             Value
 ---             -----
-lease_id        database/creds/readonly/a582cdcc-53b0-0bbb-2bf1-570926f65294
-lease_duration  1h0m0s
-lease_renewable true
-password        A1a-w82s717qy2q26r80
-username        v-root-readonly-p0p409z36t7zt4p1
+Seal Type       shamir
+Sealed          false
+Total Shares    5
+Threshold       3
+Version         0.9.1
+Cluster Name    vault-cluster-42f88b39
+Cluster ID      769f9d92-3e75-87ef-f8da-8fcbbfb737da
+HA Enabled      false
+
+root@bastion:~/bastion-proxy# vault policy list
+default
+root
 ```
 
-## Test login with this user
-`mysql -hmysqlprimary -uv-root-readonly-p0p409z36t7zt4p1 -pA1a-w82s717qy2q26r80`
+**OpenLDAP Config**
 
-# Using ProxySQL <a name="proxysql"></a>
+If you want to use the OpenLDAP docker instance that is part of the docker compose.  You can use a web browser to load the admin website to manage the OpenLDAP instance.  This uses the application called PHP LDAP ADMIN (http://phpldapadmin.sourceforge.net/wiki/index.php/Main_Page).  Launch a browswer and go to the IP of the server on port 8080.  IP should be located in /etc/hosts
 
-## Create ProxySQL monitor user
+http://192.168.0.54:8080/
 
-```
-source initiate_proxysql.sh
-```
+USER : cn=admin,dc=proxysql,dc=com 
+PASSWORD = password
+  
+Once logged in create users and groups that will be used for authentication.
 
-## Add login to ProxySQL
-```
-mysql -hproxysql -uadmin -padmin -P6032
+## Configuration
 
-insert into mysql_users (username,password) values ("v-root-readonly-p0p409z36t7zt4p1","A1a-w82s717qy2q26r80");
-LOAD MYSQL USERS TO RUNTIME;
-SAVE MYSQL USERS TO DISK;
-```
-
-## Connect via ProxySQL
-`mysql -hproxysql -P3306 -uv-root-readonly-p0p409z36t7zt4p1 -pA1a-w82s717qy2q26r80`
-
-## Do the user addition programmatically
-`source create_user.sh`
-
-# LDAP <a name="ldap"></a>
-
-## Install LDAP packages
-
-`source install_ldap.sh`
-
-## Using web interface
-
-Visit http://localhost:8080 in the browser.
-
-Login as:
-user = <i>cn=admin,dc=proxysql,dc=com</i> and password = <i>password</i>
-
-Create two OU (groups, users), two posix accounts under groups (developer, bi), and one user account (e.g., vthompson) under users. See the walkthrough on the blog post ____________________ for screenshots and more details on setting up LDAP.
-
-## Test from app server
-
-Get IP address to use in statement below:
-```
-docker inspect --format='{{ .NetworkSettings.Networks.adjacents_default.IPAddress }}' openldap
-
-ldapwhoami -vvv -H ldap://172.18.0.5 -D cn=vthompson,ou=users,dc=proxysql,dc=com -x -wpassword
-```
-
-## Get info for this user
-
-```
-ldapsearch -LL -H ldap://172.18.0.5 -b "ou=users,dc=proxysql,dc=com" -D "cn=admin,dc=proxysql,dc=com" -w "password"
-```
-
-## Create and connect ldap backend, test
-
-```
-vault auth-enable ldap
-
-vault auth -methods
-
-vault write auth/ldap/config \
-  url="ldap://172.18.0.5" \
-  binddn="cn=admin,dc=proxysql,dc=com" \
-  bindpass="password" \
-  userattr="uid" \
-  userdn="ou=users,dc=proxysql,dc=com" \
-  discoverdn=true \
-  groupdn="ou=groups,dc=proxysql,dc=com" \
-  insecure_tls=true
-
-vault write auth/ldap/groups/developer policies=developer
-
-vault write auth/ldap/users/vthompson groups=developer
-
-vault auth -method=ldap username=vthompson
-[enter password at command prompt]
-```
-
-And now experiment!
-
+Now that environment has been built.  It needs to be configured.
+https://github.com/kevinmarkwardt/bastion-proxy/blob/master/docs/Configuration.md

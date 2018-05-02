@@ -1,4 +1,5 @@
-backend "inmem" {
+storage "file" {
+	path = "/vault/file"
 }
 
 listener "tcp" {

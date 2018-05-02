@@ -1,0 +1,223 @@
+- hosts: 127.0.0.1
+  connection: local
+  vars:
+    - docker_instances: '' 
+  vars_files:
+    - mysql-proxy-build-config.yml
+  tasks:
+
+# Build Docker Instances
+
+    - name: Check for Vault Docker Instance
+      set_fact:
+        docker_instances: "{{ docker_instances }} vault"
+      when: vault.docker_instance
+
+    - name: Check for LDAP Docker Instance
+      set_fact:
+        docker_instances: "{{ docker_instances }} openldap phpldapadmin"
+      when: ldap.docker_instance
+
+    - name: Check for ProxySQL Instance
+      set_fact:
+        docker_instances: "{{ docker_instances }} proxysql"
+      when: proxysql.docker_instance
+
+    - name: Check for MySQL Inventory Instance
+      set_fact:
+        docker_instances: "{{ docker_instances }} mysql_local"
+      when: mysql_inventory.docker_instance 
+
+    - name: Deploying these docker instances - {{ docker_instances }}
+      shell: docker-compose up -d {{ docker_instances }}
+      args:
+        chdir: "{{ repo_path }}"
+      when: vault.docker_instance
+
+    - name: Cofigure docker IP's into /etc/hosts
+      shell: initiate/initiate_docker_hosts_ip.sh
+
+    - name: Configure docker instances to start on boot
+      lineinfile:
+        dest: /etc/rc.local
+        line: 'docker start $(docker ps -a -q); sleep 5'
+        insertbefore: 'exit 0'
+        regexp: "^docker"
+        state: present
+
+    - name: Configure docker instances to start on boot
+      lineinfile:
+        dest: /etc/rc.local
+        line: '/root/mysql-bastion/initiate/initiate_docker_hosts_ip.sh'
+        insertbefore: 'exit 0'
+        regexp: "^/root/mysql-bastion/initiate/initiate_docker_hosts_ip.sh"
+        state: present
+
+# Configure MySQL / ProxySQL configuration.  Will check for .my.cnf.  If it doesn't exist, then this is the first run.  If a docker instance was created.  Set the creds on it and update it's root password and create the remote user.
+# If no docker instance was created, then just create the .my.cnf and test connectivity and make sure the inventory user exists.  Dont use root for a custom mysql inventory server.
+
+    - name: Check if mysql inventory user my.cnf exists.
+      stat:
+        path: ~/.my.cnf
+      register: my_cnf_result
+
+    - name: Check if proxysql cnf exists.
+      stat:
+        path: ~/.proxysql.cnf
+      register: proxysql_cnf_result
+
+    - set_fact:
+        template_user: "{{ mysql_inventory.mysql_inventory_user }}"
+
+    - set_fact:
+        template_password: "{{ mysql_inventory.mysql_inventory_pass }}"
+
+    - name: Set mysql host variable {{ mysql_inventory.mysql_host }}
+      set_fact:
+        template_hostname: "{{ mysql_inventory.mysql_host }}"
+
+    - set_fact:
+        template_port: "{{ mysql_inventory.mysql_port }}"
+
+    - name: .my.cnf doesn't exist.  Creating it
+      template:
+        src: "conf/client.my.cnf.j2"
+        dest: "~/.my.cnf"
+        owner: root
+        group: root
+        mode: 0600
+      when: my_cnf_result.stat.exists == False 
+
+    - set_fact:
+        template_user: "{{ proxysql.remote_admin_user }}"
+
+    - set_fact:
+        template_password: "{{ proxysql.remote_admin_pass }}"
+
+    - set_fact:
+        template_hostname: "{{ proxysql.proxysql_host }}"
+
+    - set_fact:
+        template_port: "{{ proxysql.admin_proxysql_port }}"
+
+    - name: .proxysql.cnf doesn't exist.  Creating it
+      template:
+        src: "conf/client.my.cnf.j2"
+        dest: "~/.proxysql.cnf"
+        owner: root
+        group: root
+        mode: 0600
+      when: proxysql_cnf_result.stat.exists == False
+
+    - name: Create and configure inventory user in MySQL Local MySQL instance
+      shell: mysql -h {{ mysql_inventory.mysql_host }} -P{{ mysql_inventory.mysql_port }} -u root -pD0ckerpassw0rd -e "CREATE USER '{{ mysql_inventory.mysql_inventory_user }}'@'%' IDENTIFIED BY '{{ mysql_inventory.mysql_inventory_pass }}'; GRANT ALL PRIVILEGES ON *.* TO '{{ mysql_inventory.mysql_inventory_user }}'@'%' WITH GRANT OPTION"
+      when: mysql_inventory.docker_instance and my_cnf_result.stat.exists == False
+      retries: 5
+      delay: 5
+      ignore_errors: yes
+      register: task_result
+      until: task_result.rc == 0
+
+    - name: Create and configure inventory user in Remote MySQL inventory Store
+      shell: mysql -h {{ mysql_inventory.mysql_host }} -P{{ mysql_inventory.mysql_port }} -u{{ mysql_inventory.user }} -p{{ mysql_inventory.pass }} -e "CREATE USER '{{ mysql_inventory.mysql_inventory_user }}'@'%' IDENTIFIED BY '{{ mysql_inventory.mysql_inventory_pass }}'; GRANT ALL PRIVILEGES ON *.* TO '{{ mysql_inventory.mysql_inventory_user }}'@'%' WITH GRANT OPTION"
+      when: not mysql_inventory.docker_instance and my_cnf_result.stat.exists == False
+      retries: 5
+      delay: 5
+      ignore_errors: yes
+      register: task_result
+      until: task_result.rc == 0
+
+    - name: Configure MySQL root password
+      shell: mysql -h {{ mysql_inventory.mysql_host }} -P{{ mysql_inventory.mysql_port }} -u root -pD0ckerpassw0rd -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ mysql_inventory.pass }}'; ALTER USER 'root'@'%' IDENTIFIED BY '{{ mysql_inventory.pass }}'"
+      when: mysql_inventory.docker_instance and my_cnf_result.stat.exists == False
+
+    - name: Configure ProxySQL remote admin password
+      shell: docker exec proxysql mysql -uadmin -padmin -h 127.0.0.1 -P6032 -e "UPDATE global_variables SET variable_value='admin:{{ proxysql.admin_pass }};{{ proxysql.remote_admin_user }}:{{ proxysql.remote_admin_pass }}' WHERE variable_name='admin-admin_credentials';LOAD ADMIN VARIABLES TO RUNTIME;SAVE ADMIN VARIABLES TO DISK;";
+      when: proxysql.docker_instance and proxysql_cnf_result.stat.exists == False
+
+# Configure Vault Connection Parameters
+
+    - name: Set Export Vault Address in Root Login Script
+      lineinfile: 
+        dest: /root/.bashrc 
+        line: "export VAULT_ADDR=http://{{ vault.host }}:{{ vault.vault_port }}" 
+        insertafter: 'EOF' 
+        regexp: "^export VAULT_ADDR"
+        state: present
+
+    - name: Source the bashrc file, to load Environment Variables
+      shell: source /root/.bashrc
+      args:
+        executable: /bin/bash
+
+    - name: Initialize Vault Instance, if it's local
+      shell: initiate/initiate_vault.sh 
+      when: vault.docker_instance
+
+    - name: Get token from new deployment
+      shell: cat /root/vault_details | grep Token | awk '{print $4}' 
+      when: vault.docker_instance
+      register: vault_token_output
+
+    - name: Get Token from Vault Initial deployment in /root/vault_details
+      set_fact:
+        vault_token: "{{ vault_token_output.stdout }}"
+      when: vault.docker_instance
+
+    - name: Get Token from config file
+      set_fact:
+        vault_token: "{{ vault.token }}"
+      when: not vault.docker_instance
+
+    - name: Set Export Vault Token in Root Login Script
+      lineinfile:
+        dest: /root/.bashrc
+        line: "export VAULT_TOKEN={{ vault_token }}"
+        insertafter: 'EOF'
+        regexp: "^export VAULT_TOKEN"
+        state: present
+
+# Check connectivity
+
+    - name: Test MySQL Inventory Connectivity
+      shell: mysql --defaults-file=~/.my.cnf -e "SELECT @@hostname"
+      register: mysql_connectivity_test
+
+    - name: Test ProxySQL Connectivity
+      shell: mysql --defaults-file=~/.proxysql.cnf -e "SELECT @@hostname"
+      register: proxysql_connectivity_test
+
+    - name: Test Vault Connectivity
+      shell: vault status
+      environment:
+        VAULT_TOKEN: "{{ vault_token }}"
+        VAULT_ADDR: "http://{{ vault.host }}:{{ vault.vault_port }}"
+      register: vault_connectivity_test
+
+    - name: Test LDAP Connectivity
+      shell: ldapsearch -H ldap://{{ ldap.host }}:{{ ldap.ldap_port }} -x -D "{{ ldap.ldap_user }}" -w {{ ldap.ldap_pass }} -b "{{ ldap.ldap_base }}"
+      register: ldap_connectivity_test
+
+# Initial Configuration 
+
+    - name: Create MySQL inventory database and table
+      shell: mysql --defaults-file=~/.my.cnf -e "CREATE DATABASE IF NOT EXISTS mysql_inventory"
+
+    - name: Create MySQL inventory table
+      shell: mysql --defaults-file=~/.my.cnf mysql_inventory -e "CREATE TABLE IF NOT EXISTS hosts (id int(11) NOT NULL AUTO_INCREMENT, host varchar(255) DEFAULT NULL, ip varchar(45) DEFAULT NULL,port int(11) DEFAULT '3306', enabled tinyint(4) DEFAULT '1', creds_created_count int(11) DEFAULT '0',  PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=latin1;"
+
+    - name: Check if vault cnf exists.
+      stat:
+        path: ./logs/vault/vault_audit.log
+      register: vault_log_result
+
+    - name: Enable logging for vault Docker instance
+      shell: vault audit enable file file_path=/vault/logs/vault_audit.log
+      environment:
+        VAULT_TOKEN: "{{ vault_token }}"
+        VAULT_ADDR: "http://{{ vault.host }}:{{ vault.vault_port }}"
+      when: vault.docker_instance and not vault_log_result
+
+    - name: Enable ProxySQL logging, on local instance
+      shell: mysql --defaults-file=~/.proxysql.cnf -e "SET mysql-eventslog_filename='/var/local/queries.log';LOAD MYSQL VARIABLES TO RUNTIME;SAVE MYSQL VARIABLES TO DISK;"
+      when: proxysql.docker_instance
